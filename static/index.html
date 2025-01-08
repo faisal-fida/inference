@@ -89,9 +89,8 @@
 
         mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({
-          sampleRate: 16000,
-        });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const sampleRate = audioContext.sampleRate; // Typically 44100 Hz or 48000 Hz
 
         await audioContext.audioWorklet.addModule("/static/processor.js");
         processor = new AudioWorkletNode(audioContext, "voice-processor");
@@ -118,15 +117,20 @@
           console.warn("setSinkId is not supported in your browser.");
         }
 
-        // Connect gainNode to audioContext destination
         gainNode.connect(audioContext.destination);
+
+        // processor.port.onmessage = (event) => {
+        //   const inputBuffer = event.data;
+        //   // Send audio data to server
+        //   if (ws.readyState === WebSocket.OPEN) {
+        //     ws.send(inputBuffer);
+        //   }
+        // };
 
         processor.port.onmessage = (event) => {
           const inputBuffer = event.data;
-          // Send audio data to server
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(inputBuffer);
-          }
+          audioQueue.push(inputBuffer);
+          playAudioQueue();
         };
 
         ws.onmessage = function (event) {
@@ -163,8 +167,27 @@
 
           // Connect to gainNode instead of audioContext.destination
           outputSource.connect(audioContext.destination);
-          outputSource.start();
-          outputSource.onended = playAudioQueue;
+
+          // Schedule playback
+          let currentTime = audioContext.currentTime;
+
+          if (typeof playAudioQueue.lastTime === "undefined") {
+            playAudioQueue.lastTime = currentTime;
+          }
+
+          // Schedule playback
+          outputSource.start(playAudioQueue.lastTime);
+
+          // Update lastTime for next chunk
+          playAudioQueue.lastTime += audioBuffer.duration;
+
+          // When playback ends, play the next chunk
+          outputSource.onended = () => {
+            playAudioQueue();
+          };
+        } else {
+          // Reset lastTime if queue is empty
+          playAudioQueue.lastTime = undefined;
         }
       }
 

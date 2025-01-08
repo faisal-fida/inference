@@ -26,19 +26,14 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            # Receive audio data from client
             data = await websocket.receive_bytes()
             # Process audio data
             # processed_data = await asyncio.get_event_loop().run_in_executor(
             #     None, model_processor.process_audio_chunk, data
             # )
-
-            import numpy as np
-
-            processed_data = np.flip(data)
-
+            processed_data = data
+            
             if processed_data:
-                # Send processed audio back to client
                 await websocket.send_bytes(processed_data)
     except WebSocketDisconnect:
         pass
