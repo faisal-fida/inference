@@ -272,3 +272,7 @@ class ModelProcessor:
             [chunk1[:-overlap], chunk1[-overlap:] + chunk2[:overlap], chunk2[overlap:]]
         )
         return crossfaded
+
+
+# Instantiate the ModelProcessor
+model_processor = ModelProcessor()

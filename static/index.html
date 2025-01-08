@@ -20,7 +20,7 @@
       let audioContext;
       let processor;
       let source;
-      let audioQueue = [];
+      let playerNode;
 
       // Function to populate the input and output device lists
       async function populateDeviceLists() {
@@ -93,7 +93,12 @@
         const sampleRate = audioContext.sampleRate; // Typically 44100 Hz or 48000 Hz
 
         await audioContext.audioWorklet.addModule("/static/processor.js");
+        await audioContext.audioWorklet.addModule(
+          "/static/player-processor.js"
+        );
+
         processor = new AudioWorkletNode(audioContext, "voice-processor");
+        playerNode = new AudioWorkletNode(audioContext, "player-processor");
 
         source = audioContext.createMediaStreamSource(mediaStream);
         source.connect(processor);
@@ -105,91 +110,43 @@
         processor.connect(gainNode);
 
         // Set the output device if sinkId is supported and output device is selected
-        if ("setSinkId" in audioContext.destination) {
-          try {
-            const sinkId = outputDeviceId || "default";
-            await audioContext.destination.setSinkId(sinkId);
-            console.log(`Output device set to ${sinkId}`);
-          } catch (err) {
-            console.error(`Failed to set output device: ${err}`);
-          }
-        } else {
-          console.warn("setSinkId is not supported in your browser.");
-        }
+        const sinkId = outputDeviceId || "default";
+        await audioContext.setSinkId(sinkId);
 
-        gainNode.connect(audioContext.destination);
-
-        // processor.port.onmessage = (event) => {
-        //   const inputBuffer = event.data;
-        //   // Send audio data to server
-        //   if (ws.readyState === WebSocket.OPEN) {
-        //     ws.send(inputBuffer);
+        // if ("setSinkId" in audioContext.destination) {
+        //   try {
+        //     const sinkId = outputDeviceId || "default";
+        //     await audioContext.destination.setSinkId(sinkId);
+        //     console.log(`Output device set to ${sinkId}`);
+        //   } catch (err) {
+        //     console.error(`Failed to set output device: ${err}`);
         //   }
-        // };
+        // } else {
+        //   console.warn("setSinkId is not supported in your browser.");
+        // }
+
+        // Connect gainNode to playerNode and then to destination
+        gainNode.connect(playerNode).connect(audioContext.destination);
 
         processor.port.onmessage = (event) => {
           const inputBuffer = event.data;
-          audioQueue.push(inputBuffer);
-          playAudioQueue();
+          // Send audio data to server
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(inputBuffer);
+          }
         };
 
         ws.onmessage = function (event) {
-          let arrayBuffer = event.data;
-          audioQueue.push(arrayBuffer);
-          playAudioQueue();
+          const arrayBuffer = event.data;
+          // Assume that the server returns Float32Array data
+          // Send the audio data to the player processor
+          playerNode.port.postMessage(arrayBuffer);
         };
 
         ws.onclose = function () {
           console.log("WebSocket connection closed.");
         };
       };
-
-      function playAudioQueue() {
-        if (audioQueue.length > 0) {
-          let arrayBuffer = audioQueue.shift();
-
-          // Convert the ArrayBuffer to Float32Array
-          let float32Array = new Float32Array(arrayBuffer);
-
-          // Create an AudioBuffer
-          let audioBuffer = audioContext.createBuffer(
-            1,
-            float32Array.length,
-            audioContext.sampleRate
-          );
-
-          // Copy the PCM data into the AudioBuffer
-          audioBuffer.getChannelData(0).set(float32Array);
-
-          // Create a BufferSource and play the audio
-          let outputSource = audioContext.createBufferSource();
-          outputSource.buffer = audioBuffer;
-
-          // Connect to gainNode instead of audioContext.destination
-          outputSource.connect(audioContext.destination);
-
-          // Schedule playback
-          let currentTime = audioContext.currentTime;
-
-          if (typeof playAudioQueue.lastTime === "undefined") {
-            playAudioQueue.lastTime = currentTime;
-          }
-
-          // Schedule playback
-          outputSource.start(playAudioQueue.lastTime);
-
-          // Update lastTime for next chunk
-          playAudioQueue.lastTime += audioBuffer.duration;
-
-          // When playback ends, play the next chunk
-          outputSource.onended = () => {
-            playAudioQueue();
-          };
-        } else {
-          // Reset lastTime if queue is empty
-          playAudioQueue.lastTime = undefined;
-        }
-      }
 
       document.getElementById("stopButton").onclick = () => {
         if (processor) {
@@ -204,7 +161,10 @@
         if (ws) {
           ws.close();
         }
-        audioQueue = [];
+        // Disconnect the playerNode
+        if (playerNode) {
+          playerNode.disconnect();
+        }
       };
     </script>
   </body>

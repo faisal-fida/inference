@@ -2,13 +2,10 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-# import asyncio
-# from model import ModelProcessor
+# import numpy as np
+# import librosa
 
 app = FastAPI()
-
-# Initialize the model processor
-# model_processor = ModelProcessor()
 
 
 # Serve index.html at the root path
@@ -26,13 +23,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            data = await websocket.receive_bytes()
-            # Process audio data
-            # processed_data = await asyncio.get_event_loop().run_in_executor(
-            #     None, model_processor.process_audio_chunk, data
-            # )
-            processed_data = data
-            
+            processed_data = await websocket.receive_bytes()
             if processed_data:
                 await websocket.send_bytes(processed_data)
     except WebSocketDisconnect:
