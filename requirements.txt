@@ -5,3 +5,7 @@ torchaudio
 numpy
 huggingface_hub
 munch
+librosa
+einops
+git+https://github.com/descriptinc/audiotools
+transformers
