@@ -48,7 +48,6 @@ def process_audio_file(file_path, processor):
 
     # Process the entire audio data as a single chunk
     processed_output = processor.process_audio_chunk(audio_data)
-    print("Shape:", processed_output.shape)
     
     
 process_audio_file("examples/source/source_s1.wav", voice_changer)

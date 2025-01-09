@@ -454,7 +454,6 @@ class VoiceChanger:
         elif len(res_value) % 2 == 1 and self.vad_speech_detected:
             self.set_speech_detected_false_at_end_flag = True
 
-        
         expected_chunk_size = self.block_frame
         if indata_np.shape[0] != expected_chunk_size:
             if indata_np.shape[0] > expected_chunk_size:
