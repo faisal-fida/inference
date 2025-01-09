@@ -7,7 +7,14 @@ import numpy as np
 import torch
 from modules.commons import str2bool
 from realtime import VoiceChanger, load_models
+import os
+import time
+from scipy.io import wavfile
 
+
+SAMPLE_RATE = 44100
+WAV_OUTPUT_DIR = "wav_output"
+os.makedirs(WAV_OUTPUT_DIR, exist_ok=True)
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -28,7 +35,6 @@ device = torch.device(cuda_target if torch.cuda.is_available() else "cpu")
 model_set = load_models(args)
 
 config = {
-    "samplerate": 16000,
     "block_time": 0.25,  # in seconds
     "crossfade_time": 0.05,
     "extra_time_ce": 2.5,
@@ -56,15 +62,23 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    audio_chunks = []  # Buffer to store all chunks
     try:
         while True:
             processed_data = await websocket.receive_bytes()
             processed_data = np.frombuffer(processed_data, dtype=np.float32)
-            processed_data = voice_changer.process(processed_data)
-            if processed_data:
+            processed_data = voice_changer.process_audio_chunk(processed_data)
+            if processed_data is not None:
+                processed_data = np.clip(processed_data, -1, 1)
+                audio_chunks.append(processed_data)  # Store chunk in buffer
                 await websocket.send_bytes(processed_data.tobytes())
     except WebSocketDisconnect:
-        pass
+        if audio_chunks:  # Save complete audio when connection ends
+            complete_audio = np.concatenate(audio_chunks)
+            audio_16bit = (complete_audio * 32767).astype(np.int16)
+            timestamp = int(time.time())
+            wav_filename = os.path.join(WAV_OUTPUT_DIR, f"complete_audio_{timestamp}.wav")
+            wavfile.write(wav_filename, SAMPLE_RATE, audio_16bit)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import os
 import sys
 from dotenv import load_dotenv
-import shutil
+import numpy as np
 
 load_dotenv()
 
@@ -11,26 +11,19 @@ if sys.platform == "darwin":
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
-import multiprocessing
 import warnings
 import yaml
 
 warnings.simplefilter("ignore")
 
-from tqdm import tqdm
-from modules.commons import *
 import librosa
 import torchaudio
-import torchaudio.compliance.kaldi as kaldi
-
+from modules.commons import *
 from hf_utils import load_custom_model_from_hf
 
-import os
-import sys
 import torch
 from modules.commons import str2bool
 
-# Load model and configuration
 device = None
 
 flag_vc = False
@@ -108,7 +101,6 @@ def custom_infer(
     target_lengths = torch.LongTensor(
         [(skip_head + return_length + skip_tail - ce_dit_frame_difference) / 50 * sr // hop_length]
     ).to(S_alt.device)
-    print(f"target_lengths: {target_lengths}")
     cond = model.length_regulator(S_alt, ylens=target_lengths, n_quantizers=3, f0=None)[0]
     cat_condition = torch.cat([prompt_condition, cond], dim=1)
     with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
@@ -122,7 +114,6 @@ def custom_infer(
             inference_cfg_rate=inference_cfg_rate,
         )
         vc_target = vc_target[:, :, mel2.size(-1) :]
-        print(f"vc_target.shape: {vc_target.shape}")
         vc_wave = vocoder_fn(vc_target).squeeze()
     output_len = return_length * sr // 50
     tail_len = skip_tail * sr // 50
@@ -375,13 +366,21 @@ class VoiceChanger:
 
     def initialize_buffers(self):
         # Initialize the buffers and variables as per the code in `start_vc` method
-        self.samplerate = self.config.get("samplerate", self.model_set[-1]["sampling_rate"])
-        self.zc = self.samplerate // 50  # 44100 // 100 = 441
+        # Get the model sample rate
+        self.samplerate = self.model_set[-1]["sampling_rate"]
+
+        self.zc = self.samplerate // 50  # Typically 44100 // 50 = 882
+
+        # Use configuration parameters or defaults
         self.block_time = self.config.get("block_time", 0.25)
         self.crossfade_time = self.config.get("crossfade_time", 0.05)
         self.extra_time_ce = self.config.get("extra_time_ce", 2.5)
         self.extra_time = self.config.get("extra_time", 0.5)
         self.extra_time_right = self.config.get("extra_time_right", 2.0)
+        self.diffusion_steps = self.config.get("diffusion_steps", 10)
+        self.inference_cfg_rate = self.config.get("inference_cfg_rate", 0.7)
+        self.max_prompt_length = self.config.get("max_prompt_length", 3.0)
+
         self.block_frame = int(np.round(self.block_time * self.samplerate / self.zc)) * self.zc
         self.block_frame_16k = 320 * self.block_frame // self.zc
         self.crossfade_frame = (
@@ -407,7 +406,7 @@ class VoiceChanger:
             dtype=torch.float32,
         )
         self.input_wav_res = torch.zeros(
-            320 * self.input_wav.shape[0] // self.zc,
+            320 * total_input_frames // self.zc,
             device=self.device,
             dtype=torch.float32,
         )
@@ -477,14 +476,29 @@ class VoiceChanger:
             self.set_speech_detected_false_at_end_flag = True
 
         # Update input buffer
-        self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
-        self.input_wav[-indata_np.shape[0] :] = torch.from_numpy(indata_np).to(self.device)
-        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
-            self.block_frame_16k :
-        ].clone()
-        self.input_wav_res[-320 * (indata_np.shape[0] // self.zc + 1) :] = self.resampler(
-            self.input_wav[-indata_np.shape[0] - 2 * self.zc :]
-        )[320:]
+
+        # First, ensure that indata_np has the expected size
+        expected_chunk_size = self.block_frame
+        if indata_np.shape[0] != expected_chunk_size:
+            # Pad or truncate indata_np to match expected_chunk_size
+            if indata_np.shape[0] > expected_chunk_size:
+                indata_np = indata_np[:expected_chunk_size]
+            else:
+                indata_np = np.pad(
+                    indata_np, (0, expected_chunk_size - indata_np.shape[0]), mode="constant"
+                )
+
+        self.input_wav = torch.roll(self.input_wav, -self.block_frame)
+        self.input_wav[-self.block_frame :] = torch.from_numpy(indata_np).to(self.device)
+
+        resampler_input = self.input_wav[-(self.block_frame + 2 * self.zc) :]
+
+        resampled_output = self.resampler(resampler_input)[320:]
+
+        resampled_size = resampled_output.shape[0]
+
+        self.input_wav_res = torch.roll(self.input_wav_res, -resampled_size)
+        self.input_wav_res[-resampled_size:] = resampled_output
 
         # Voice Conversion
         if self.extra_time_ce - self.extra_time < 0:
@@ -502,21 +516,21 @@ class VoiceChanger:
                 self.skip_head,
                 self.skip_tail,
                 self.return_length,
-                int(self.config.get("diffusion_steps", 10)),
-                self.config.get("inference_cfg_rate", 0.7),
-                self.config.get("max_prompt_length", 3.0),
+                int(self.diffusion_steps),
+                self.inference_cfg_rate,
+                self.max_prompt_length,
                 self.extra_time_ce - self.extra_time,
             )
             if self.resampler2 is not None:
                 infer_wav = self.resampler2(infer_wav)
         else:
-            infer_wav = torch.zeros_like(self.input_wav[self.extra_frame :])
+            infer_wav = torch.zeros_like(self.input_wav[self.extra_frame : -self.extra_frame_right])
 
         # SOLA algorithm
         conv_input = infer_wav[None, None, : self.sola_buffer_frame + self.sola_search_frame]
-        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+        cor_nom = torch.nn.functional.conv1d(conv_input, self.sola_buffer[None, None, :])
         cor_den = torch.sqrt(
-            F.conv1d(
+            torch.nn.functional.conv1d(
                 conv_input**2,
                 torch.ones(1, 1, self.sola_buffer_frame, device=self.device),
             )
@@ -529,6 +543,10 @@ class VoiceChanger:
             sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
 
         infer_wav = infer_wav[sola_offset:]
+        infer_wav = torch.nn.functional.pad(
+            infer_wav, (0, max(0, self.block_frame - infer_wav.shape[0]))
+        )
+
         infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
         infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
         self.sola_buffer[:] = infer_wav[

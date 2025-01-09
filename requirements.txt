@@ -9,3 +9,4 @@ librosa
 einops
 git+https://github.com/descriptinc/audiotools
 transformers
+funasr
