@@ -7,14 +7,7 @@ import numpy as np
 import torch
 from modules.commons import str2bool
 from realtime import VoiceChanger, load_models
-import os
-import time
-from scipy.io import wavfile
 
-
-SAMPLE_RATE = 44100
-WAV_OUTPUT_DIR = "wav_output"
-os.makedirs(WAV_OUTPUT_DIR, exist_ok=True)
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -22,7 +15,7 @@ parser.add_argument(
 )
 parser.add_argument("--config-path", type=str, default=None, help="Path to the vocoder checkpoint")
 parser.add_argument(
-    "--reference-audio-path", type=str, required=True, help="Path to reference audio"
+    "--reference-audio-path", type=str, default="examples/reference/azuma_0.wav", help="Path to the reference audio"
 )
 parser.add_argument(
     "--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True
@@ -31,7 +24,7 @@ parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
 args = parser.parse_args()
 cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda"
 device = torch.device(cuda_target if torch.cuda.is_available() else "cpu")
-
+print(f"Using device: {device} to Load models")
 model_set = load_models(args)
 
 config = {
@@ -58,28 +51,32 @@ async def read_index():
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    audio_chunks = []  # Buffer to store all chunks
+    
+    SAMPLE_RATE = 44100
+    SAMPLES_PER_SECOND = SAMPLE_RATE
+    
+    audio_buffer = np.array([], dtype=np.float32)
+    
     try:
         while True:
-            processed_data = await websocket.receive_bytes()
-            processed_data = np.frombuffer(processed_data, dtype=np.float32)
-            processed_data = voice_changer.process_audio_chunk(processed_data)
-            if processed_data is not None:
-                processed_data = np.clip(processed_data, -1, 1)
-                audio_chunks.append(processed_data)  # Store chunk in buffer
-                await websocket.send_bytes(processed_data.tobytes())
-    except WebSocketDisconnect:
-        if audio_chunks:  # Save complete audio when connection ends
-            complete_audio = np.concatenate(audio_chunks)
-            audio_16bit = (complete_audio * 32767).astype(np.int16)
-            timestamp = int(time.time())
-            wav_filename = os.path.join(WAV_OUTPUT_DIR, f"complete_audio_{timestamp}.wav")
-            wavfile.write(wav_filename, SAMPLE_RATE, audio_16bit)
+            data = await websocket.receive_bytes()
+            chunk = np.frombuffer(data, dtype=np.float32)
+            
+            audio_buffer = np.concatenate([audio_buffer, chunk])
+            
+            if len(audio_buffer) >= SAMPLES_PER_SECOND:
+                to_process = audio_buffer[:SAMPLES_PER_SECOND]
+                processed_data = voice_changer.process_audio_chunk(to_process)
+                if processed_data is not None:
+                    await websocket.send_bytes(processed_data.tobytes())
+                
+                audio_buffer = audio_buffer[SAMPLES_PER_SECOND:]
 
+    except WebSocketDisconnect:
+        print("Client disconnected")
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="127.0.0.1", port=8000, log_level="info")

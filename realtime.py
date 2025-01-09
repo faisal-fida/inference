@@ -5,6 +5,8 @@ import numpy as np
 
 load_dotenv()
 
+chunks_list = []
+
 os.environ["OMP_NUM_THREADS"] = "4"
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -34,6 +36,10 @@ reference_wav_name = ""
 prompt_len = 3  # in seconds
 ce_dit_difference = 2.0  # 2 seconds
 fp16 = False
+
+cuda_target = "cuda"
+device = torch.device(cuda_target if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device} to Load models")
 
 
 @torch.no_grad()
@@ -115,6 +121,11 @@ def custom_infer(
         )
         vc_target = vc_target[:, :, mel2.size(-1) :]
         vc_wave = vocoder_fn(vc_target).squeeze()
+
+        print(f"Vocoder output range: {vc_wave.min().item()} to {vc_wave.max().item()}")
+        if vc_wave.abs().max() < 1e-6:  # If essentially zero
+            print("Warning: Vocoder producing silent output")
+
     output_len = return_length * sr // 50
     tail_len = skip_tail * sr // 50
     output = vc_wave[-output_len - tail_len : -tail_len]
@@ -295,6 +306,7 @@ def load_models(args):
             ori_waves_16k_input_list = [
                 waves_16k[bib].cpu().numpy() for bib in range(len(waves_16k))
             ]
+            print(f"Device: {device}")
             ori_inputs = wav2vec_feature_extractor(
                 ori_waves_16k_input_list,
                 return_tensors="pt",
@@ -368,7 +380,6 @@ class VoiceChanger:
         # Initialize the buffers and variables as per the code in `start_vc` method
         # Get the model sample rate
         self.samplerate = self.model_set[-1]["sampling_rate"]
-
         self.zc = self.samplerate // 50  # Typically 44100 // 50 = 882
 
         # Use configuration parameters or defaults
@@ -450,14 +461,7 @@ class VoiceChanger:
             self.resampler2 = None
 
     def process_audio_chunk(self, indata_np):
-        """
-        Process an audio chunk and return the processed chunk.
-        Parameters:
-            - indata_np (numpy.ndarray): Input audio chunk as a numpy array.
-        Returns:
-            - outdata_np (numpy.ndarray): Processed audio chunk as a numpy array.
-        """
-        # Convert to mono if necessary
+
         if indata_np.ndim > 1:
             indata_np = librosa.to_mono(indata_np.T)
 
@@ -474,8 +478,6 @@ class VoiceChanger:
             self.vad_speech_detected = True
         elif len(res_value) % 2 == 1 and self.vad_speech_detected:
             self.set_speech_detected_false_at_end_flag = True
-
-        # Update input buffer
 
         # First, ensure that indata_np has the expected size
         expected_chunk_size = self.block_frame
@@ -505,7 +507,8 @@ class VoiceChanger:
             raise ValueError(
                 "Content encoder extra context must be greater than DiT extra context!"
             )
-
+    
+        print("VAD Speech Detected:", self.vad_speech_detected)
         if self.vad_speech_detected:
             infer_wav = custom_infer(
                 self.model_set,
@@ -558,4 +561,14 @@ class VoiceChanger:
             self.vad_speech_detected = False
             self.set_speech_detected_false_at_end_flag = False
 
+
+        # save the output to a file
+        chunks_list.append(outdata_np)
+        if len(chunks_list) == 100:
+            with open("output.wav", "ab") as f:
+                for chunk in chunks_list:
+                    f.write(chunk)
+            chunks_list.clear()
+            print("Saved 100 chunks to output.wav")
+            exit(0)
         return outdata_np
