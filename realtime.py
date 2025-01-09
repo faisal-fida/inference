@@ -2,6 +2,7 @@ import os
 import sys
 from dotenv import load_dotenv
 import numpy as np
+import soundfile as sf
 
 load_dotenv()
 
@@ -417,7 +418,7 @@ class VoiceChanger:
             dtype=torch.float32,
         )
         self.input_wav_res = torch.zeros(
-            320 * total_input_frames // self.zc,
+            320 * self.input_wav.shape[0] // self.zc,
             device=self.device,
             dtype=torch.float32,
         )
@@ -479,30 +480,53 @@ class VoiceChanger:
         elif len(res_value) % 2 == 1 and self.vad_speech_detected:
             self.set_speech_detected_false_at_end_flag = True
 
+        
         # First, ensure that indata_np has the expected size
-        expected_chunk_size = self.block_frame
-        if indata_np.shape[0] != expected_chunk_size:
-            # Pad or truncate indata_np to match expected_chunk_size
-            if indata_np.shape[0] > expected_chunk_size:
-                indata_np = indata_np[:expected_chunk_size]
-            else:
-                indata_np = np.pad(
-                    indata_np, (0, expected_chunk_size - indata_np.shape[0]), mode="constant"
-                )
+        # expected_chunk_size = self.block_frame
+        # print("Chunk Size: ", expected_chunk_size)
+        # print("Indata Shape: ", indata_np.shape)
+        # if indata_np.shape[0] != expected_chunk_size:
+        #     if indata_np.shape[0] > expected_chunk_size:
+        #         indata_np = indata_np[:expected_chunk_size]
+        #     else:
+        #         indata_np = np.pad(
+        #             indata_np, (0, expected_chunk_size - indata_np.shape[0]), mode="constant"
+        #         )
 
-        self.input_wav = torch.roll(self.input_wav, -self.block_frame)
-        self.input_wav[-self.block_frame :] = torch.from_numpy(indata_np).to(self.device)
+        self.input_wav[: -self.block_frame] = self.input_wav[
+            self.block_frame :
+        ].clone()
 
-        resampler_input = self.input_wav[-(self.block_frame + 2 * self.zc) :]
+        self.input_wav[-indata_np.shape[0] :] = torch.from_numpy(indata_np).to(
+            self.device
+        )
 
-        resampled_output = self.resampler(resampler_input)[320:]
+        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
+            self.block_frame_16k :
+        ].clone()
 
-        resampled_size = resampled_output.shape[0]
+        resampled_audio = self.resampler(self.input_wav[-(indata_np.shape[0] + 2 * self.zc) :])
+        output_length = 320 * (indata_np.shape[0] // self.zc + 1)
+        processed_audio = resampled_audio[320 : 320 + output_length]
+        self.input_wav_res[-output_length:] = processed_audio
 
-        self.input_wav_res = torch.roll(self.input_wav_res, -resampled_size)
-        self.input_wav_res[-resampled_size:] = resampled_output
+        sf.write("resampled_output.wav", self.input_wav_res.cpu().numpy(), 16000)
+        exit()
 
-        # Voice Conversion
+        # self.input_wav = torch.roll(self.input_wav, -self.block_frame)
+        # self.input_wav[-self.block_frame :] = torch.from_numpy(indata_np).to(self.device)
+
+        # resampler_input = self.input_wav[-(self.block_frame + 2 * self.zc) :]
+
+        # resampled_output = self.resampler(resampler_input)[320:]
+
+        # resampled_size = resampled_output.shape[0]
+
+        # self.input_wav_res = torch.roll(self.input_wav_res, -resampled_size)
+        # self.input_wav_res[-resampled_size:] = resampled_output
+
+
+
         if self.extra_time_ce - self.extra_time < 0:
             raise ValueError(
                 "Content encoder extra context must be greater than DiT extra context!"
@@ -528,6 +552,8 @@ class VoiceChanger:
                 infer_wav = self.resampler2(infer_wav)
         else:
             infer_wav = torch.zeros_like(self.input_wav[self.extra_frame : -self.extra_frame_right])
+
+ 
 
         # SOLA algorithm
         conv_input = infer_wav[None, None, : self.sola_buffer_frame + self.sola_search_frame]
@@ -561,14 +587,4 @@ class VoiceChanger:
             self.vad_speech_detected = False
             self.set_speech_detected_false_at_end_flag = False
 
-
-        # save the output to a file
-        chunks_list.append(outdata_np)
-        if len(chunks_list) == 100:
-            with open("output.wav", "ab") as f:
-                for chunk in chunks_list:
-                    f.write(chunk)
-            chunks_list.clear()
-            print("Saved 100 chunks to output.wav")
-            exit(0)
         return outdata_np

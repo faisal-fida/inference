@@ -63,6 +63,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_bytes()
+            print(f"Received audio chunk size: {len(data)}")
             chunk = np.frombuffer(data, dtype=np.float32)
             
             audio_buffer = np.concatenate([audio_buffer, chunk])
@@ -70,6 +71,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if len(audio_buffer) >= SAMPLES_PER_SECOND:
                 to_process = audio_buffer[:SAMPLES_PER_SECOND]
                 processed_data = voice_changer.process_audio_chunk(to_process)
+                print(f"Processed audio chunk size: {len(processed_data)}")
                 if processed_data is not None:
                     await websocket.send_bytes(processed_data.tobytes())
                 
