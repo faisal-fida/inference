@@ -45,13 +45,7 @@ import soundfile as sf
 def process_audio_file(file_path, processor):
     # Load the audio file
     audio_data, sr = librosa.load(file_path, sr=None)
-    
-    # Ensure the sample rate matches the processor's sample rate
-    # if sr != processor.samplerate:
-    #     print(f"Resampling audio from {sr} to {processor.samplerate}")
-    #     audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
-    
-    
+
     # Process the entire audio data as a single chunk
     processed_output = processor.process_audio_chunk(audio_data)
     print("Shape:", processed_output.shape)
