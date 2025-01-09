@@ -4,8 +4,6 @@ from dotenv import load_dotenv
 import numpy as np
 import soundfile as sf
 
-
-
 load_dotenv()
 
 chunks_list = []
@@ -348,8 +346,6 @@ class VoiceChanger:
         self.vad_speech_detected = False
         self.set_speech_detected_false_at_end_flag = False
 
-        self.vad_chunk_size = 1000 * self.block_time
-
     def load_reference_audio(self):
         self.reference_wav, _ = librosa.load(
             self.reference_audio_path, sr=self.model_set[-1]["sampling_rate"]
@@ -440,6 +436,7 @@ class VoiceChanger:
             self.resampler2 = None
 
     def process_audio_chunk(self, indata_np):
+
         if indata_np.ndim > 1:
             indata_np = librosa.to_mono(indata_np.T)
 
@@ -449,7 +446,7 @@ class VoiceChanger:
             input=indata_16k,
             cache=self.vad_cache,
             is_final=False,
-            chunk_size=self.vad_chunk_size,
+            chunk_size=int(1000 * self.block_time),
         )
         res_value = res[0]["value"]
         if len(res_value) % 2 == 1 and not self.vad_speech_detected:
@@ -457,30 +454,31 @@ class VoiceChanger:
         elif len(res_value) % 2 == 1 and self.vad_speech_detected:
             self.set_speech_detected_false_at_end_flag = True
 
-        # Update input buffers using the reference implementation approach
-        self.input_wav[:-self.block_frame] = self.input_wav[self.block_frame:].clone()
-        self.input_wav[-indata_np.shape[0]:] = torch.from_numpy(indata_np).to(self.device)
-
-        # Update resampled buffer
-        self.input_wav_res[:-self.block_frame_16k] = self.input_wav_res[self.block_frame_16k:].clone()
-        self.input_wav_res[-320 * (indata_np.shape[0] // self.zc + 1):] = (
-            self.resampler(self.input_wav[-indata_np.shape[0] - 2 * self.zc:])[320:]
-        )
         
+        expected_chunk_size = self.block_frame
+        if indata_np.shape[0] != expected_chunk_size:
+            if indata_np.shape[0] > expected_chunk_size:
+                indata_np = indata_np[:expected_chunk_size]
+            else:
+                indata_np = np.pad(
+                    indata_np, (0, expected_chunk_size - indata_np.shape[0]), mode="constant"
+                )
+
+
         sf.write("resampled_output.wav", self.input_wav_res.cpu().numpy(), 16000)
         exit()
 
-        # self.input_wav = torch.roll(self.input_wav, -self.block_frame)
-        # self.input_wav[-self.block_frame :] = torch.from_numpy(indata_np).to(self.device)
+        self.input_wav = torch.roll(self.input_wav, -self.block_frame)
+        self.input_wav[-self.block_frame :] = torch.from_numpy(indata_np).to(self.device)
 
-        # resampler_input = self.input_wav[-(self.block_frame + 2 * self.zc) :]
+        resampler_input = self.input_wav[-(self.block_frame + 2 * self.zc) :]
 
-        # resampled_output = self.resampler(resampler_input)[320:]
+        resampled_output = self.resampler(resampler_input)[320:]
 
-        # resampled_size = resampled_output.shape[0]
+        resampled_size = resampled_output.shape[0]
 
-        # self.input_wav_res = torch.roll(self.input_wav_res, -resampled_size)
-        # self.input_wav_res[-resampled_size:] = resampled_output
+        self.input_wav_res = torch.roll(self.input_wav_res, -resampled_size)
+        self.input_wav_res[-resampled_size:] = resampled_output
 
 
 
