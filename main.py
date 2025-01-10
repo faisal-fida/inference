@@ -1,43 +1,36 @@
 import os
 import sys
+import json
+import time
+import argparse
+import torch
+import warnings
+import librosa
+import numpy as np
+import sounddevice as sd
+import torch.nn.functional as F
+import torchaudio.transforms as tat
+from multiprocessing import cpu_count
+import yaml
+import torchaudio
 from dotenv import load_dotenv
-import shutil
 
 load_dotenv()
 
 os.environ["OMP_NUM_THREADS"] = "4"
-if sys.platform == "darwin":
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
 now_dir = os.getcwd()
 sys.path.append(now_dir)
-import multiprocessing
-import warnings
-import yaml
-
 warnings.simplefilter("ignore")
 
-from tqdm import tqdm
-from modules.commons import *
-import librosa
-import torchaudio
-import torchaudio.compliance.kaldi as kaldi
-
-from hf_utils import load_custom_model_from_hf
-
-import os
-import sys
-import torch
-from modules.commons import str2bool
+from modules.commons import recursive_munch, build_model, load_checkpoint  # noqa
+from hf_utils import load_custom_model_from_hf  # noqa
+from modules.commons import str2bool  # noqa
 
 # Load model and configuration
 device = None
-
 flag_vc = False
-
 prompt_condition, mel2, style2 = None, None, None
 reference_wav_name = ""
-
 prompt_len = 3  # in seconds
 ce_dit_difference = 2.0  # 2 seconds
 fp16 = False
@@ -49,7 +42,6 @@ def custom_infer(
     reference_wav,
     new_reference_wav_name,
     input_wav_res,
-    block_frame_16k,
     skip_head,
     skip_tail,
     return_length,
@@ -360,415 +352,303 @@ class Config:
         self.device = device
 
 
-if __name__ == "__main__":
-    import json
-    import re
-    import threading
-    import time
-    import traceback
-    from multiprocessing import Queue, cpu_count
-    import argparse
+current_dir = os.getcwd()
+n_cpu = cpu_count()
 
-    import librosa
-    import numpy as np
-    import FreeSimpleGUI as sg
-    import sounddevice as sd
-    import torch
-    import torch.nn.functional as F
-    import torchaudio.transforms as tat
 
-    current_dir = os.getcwd()
-    n_cpu = cpu_count()
+class GUIConfig:
+    def __init__(self) -> None:
+        self.reference_audio_path: str = ""
+        self.diffusion_steps: int = 10
+        self.block_time: float = 0.25  # s
+        self.crossfade_time: float = 0.05
+        self.extra_time_ce: float = 2.5
+        self.extra_time: float = 0.5
+        self.extra_time_right: float = 2.0
+        self.I_noise_reduce: bool = False
+        self.O_noise_reduce: bool = False
+        self.inference_cfg_rate: float = 0.7
 
-    class GUIConfig:
-        def __init__(self) -> None:
-            self.reference_audio_path: str = ""
-            self.diffusion_steps: int = 10
-            self.sr_type: str = "sr_model"
-            self.block_time: float = 0.25  # s
-            self.threhold: int = -60
-            self.crossfade_time: float = 0.05
-            self.extra_time_ce: float = 2.5
-            self.extra_time: float = 0.5
-            self.extra_time_right: float = 2.0
-            self.I_noise_reduce: bool = False
-            self.O_noise_reduce: bool = False
-            self.inference_cfg_rate: float = 0.7
 
-    class GUI:
-        def __init__(self, args) -> None:
-            self.gui_config = GUIConfig()
-            self.config = Config()
-            self.function = "vc"
-            self.delay_time = 0
-            self.stream = None
-            self.model_set = load_models(args)
-            from funasr import AutoModel
+class GUI:
+    def __init__(self, args) -> None:
+        self.gui_config = GUIConfig()
+        self.config = Config()
+        self.function = "vc"
+        self.delay_time = 0
+        self.stream = None
+        self.model_set = load_models(args)
+        from funasr import AutoModel
 
-            self.vad_model = AutoModel(model="fsmn-vad", model_revision="v2.0.4")
-            self.update_devices()
-            self.launcher()
+        self.vad_model = AutoModel(model="fsmn-vad", model_revision="v2.0.4")
+        self.initialize_variables()
 
-        def event_handler(self):
-            global flag_vc
-            while True:
-                event, values = self.window.read()
-                if event == sg.WINDOW_CLOSED:
-                    self.stop_stream()
-                    exit()
-                if event == "reload_devices" or event == "sg_hostapi":
-                    self.gui_config.sg_hostapi = values["sg_hostapi"]
-                    self.update_devices(hostapi_name=values["sg_hostapi"])
-                    if self.gui_config.sg_hostapi not in self.hostapis:
-                        self.gui_config.sg_hostapi = self.hostapis[0]
-                    self.window["sg_hostapi"].Update(values=self.hostapis)
-                    self.window["sg_hostapi"].Update(value=self.gui_config.sg_hostapi)
-                    if (
-                        self.gui_config.sg_input_device not in self.input_devices
-                        and len(self.input_devices) > 0
-                    ):
-                        self.gui_config.sg_input_device = self.input_devices[0]
-                    self.window["sg_input_device"].Update(values=self.input_devices)
-                    self.window["sg_input_device"].Update(value=self.gui_config.sg_input_device)
-                    if self.gui_config.sg_output_device not in self.output_devices:
-                        self.gui_config.sg_output_device = self.output_devices[0]
-                    self.window["sg_output_device"].Update(values=self.output_devices)
-                    self.window["sg_output_device"].Update(value=self.gui_config.sg_output_device)
-                if event == "start_vc" and not flag_vc:
-                    if self.set_values(values) == True:
-                        self.start_vc()
-                        settings = {
-                            "reference_audio_path": values["reference_audio_path"],
-                            # "index_path": values["index_path"],
-                            "sg_hostapi": values["sg_hostapi"],
-                            "sg_wasapi_exclusive": values["sg_wasapi_exclusive"],
-                            "sg_input_device": values["sg_input_device"],
-                            "sg_output_device": values["sg_output_device"],
-                            "sr_type": ["sr_model", "sr_device"][
-                                [
-                                    values["sr_model"],
-                                    values["sr_device"],
-                                ].index(True)
-                            ],
-                            # "threhold": values["threhold"],
-                            "diffusion_steps": values["diffusion_steps"],
-                            "inference_cfg_rate": values["inference_cfg_rate"],
-                            "max_prompt_length": values["max_prompt_length"],
-                            "block_time": values["block_time"],
-                            "crossfade_length": values["crossfade_length"],
-                            "extra_time_ce": values["extra_time_ce"],
-                            "extra_time": values["extra_time"],
-                            "extra_time_right": values["extra_time_right"],
-                        }
-                        with open("configs/inuse/config.json", "w") as j:
-                            json.dump(settings, j)
-                        if self.stream is not None:
-                            self.delay_time = (
-                                self.stream.latency[-1]
-                                + values["block_time"]
-                                + values["crossfade_length"]
-                                + values["extra_time_right"]
-                                + 0.01
-                            )
-                        self.window["sr_stream"].update(self.gui_config.samplerate)
-                        self.window["delay_time"].update(int(np.round(self.delay_time * 1000)))
-                # Parameter hot update
-                # if event == "threhold":
-                #     self.gui_config.threhold = values["threhold"]
-                elif event == "diffusion_steps":
-                    self.gui_config.diffusion_steps = values["diffusion_steps"]
-                elif event == "inference_cfg_rate":
-                    self.gui_config.inference_cfg_rate = values["inference_cfg_rate"]
-                elif event in ["vc", "im"]:
-                    self.function = event
-                elif event == "stop_vc" or event != "start_vc":
-                    # Other parameters do not support hot update
-                    self.stop_stream()
+    def initialize_variables(self):
+        global flag_vc
 
-        def set_values(self, values):
-            if len(values["reference_audio_path"].strip()) == 0:
-                sg.popup("Choose an audio file")
-                return False
-            pattern = re.compile("[^\x00-\x7f]+")
-            if pattern.findall(values["reference_audio_path"]):
-                sg.popup("audio file path contains non-ascii characters")
-                return False
-            self.set_devices(values["sg_input_device"], values["sg_output_device"])
-            self.gui_config.sg_hostapi = values["sg_hostapi"]
-            self.gui_config.sg_wasapi_exclusive = values["sg_wasapi_exclusive"]
-            self.gui_config.sg_input_device = values["sg_input_device"]
-            self.gui_config.sg_output_device = values["sg_output_device"]
-            self.gui_config.reference_audio_path = values["reference_audio_path"]
-            self.gui_config.sr_type = ["sr_model", "sr_device"][
-                [
-                    values["sr_model"],
-                    values["sr_device"],
-                ].index(True)
-            ]
-            # self.gui_config.threhold = values["threhold"]
-            self.gui_config.diffusion_steps = values["diffusion_steps"]
-            self.gui_config.inference_cfg_rate = values["inference_cfg_rate"]
-            self.gui_config.max_prompt_length = values["max_prompt_length"]
-            self.gui_config.block_time = values["block_time"]
-            self.gui_config.crossfade_time = values["crossfade_length"]
-            self.gui_config.extra_time_ce = values["extra_time_ce"]
-            self.gui_config.extra_time = values["extra_time"]
-            self.gui_config.extra_time_right = values["extra_time_right"]
-            return True
+        with open("config.json", "r") as f:
+            values = json.load(f)
 
-        def start_vc(self):
-            torch.cuda.empty_cache()
-            self.reference_wav, _ = librosa.load(
-                self.gui_config.reference_audio_path, sr=self.model_set[-1]["sampling_rate"]
-            )
-            self.gui_config.samplerate = (
-                self.model_set[-1]["sampling_rate"]
-                if self.gui_config.sr_type == "sr_model"
-                else self.get_device_samplerate()
-            )
-            self.gui_config.channels = self.get_device_channels()
-            self.zc = self.gui_config.samplerate // 50  # 44100 // 100 = 441
-            self.block_frame = (
-                int(np.round(self.gui_config.block_time * self.gui_config.samplerate / self.zc))
-                * self.zc
-            )
-            self.block_frame_16k = 320 * self.block_frame // self.zc
-            self.crossfade_frame = (
-                int(np.round(self.gui_config.crossfade_time * self.gui_config.samplerate / self.zc))
-                * self.zc
-            )
-            self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
-            self.sola_search_frame = self.zc
-            self.extra_frame = (
-                int(np.round(self.gui_config.extra_time_ce * self.gui_config.samplerate / self.zc))
-                * self.zc
-            )
-            self.extra_frame_right = (
-                int(
-                    np.round(
-                        self.gui_config.extra_time_right * self.gui_config.samplerate / self.zc
-                    )
+        self.gui_config.reference_audio_path = values["reference_audio_path"]
+        self.gui_config.diffusion_steps = values["diffusion_steps"]
+        self.gui_config.inference_cfg_rate = values["inference_cfg_rate"]
+        self.gui_config.max_prompt_length = values["max_prompt_length"]
+        self.gui_config.block_time = values["block_time"]
+        self.gui_config.crossfade_time = values["crossfade_length"]
+        self.gui_config.extra_time_ce = values["extra_time_ce"]
+        self.gui_config.extra_time = values["extra_time"]
+        self.gui_config.extra_time_right = values["extra_time_right"]
+
+        self.start_vc()
+
+    def start_vc(self):
+        torch.cuda.empty_cache()
+        self.reference_wav, _ = librosa.load(
+            self.gui_config.reference_audio_path, sr=self.model_set[-1]["sampling_rate"]
+        )
+        self.gui_config.samplerate = self.model_set[-1]["sampling_rate"]
+        self.gui_config.channels = 80  # hardcore
+        self.zc = self.gui_config.samplerate // 50  # 44100 // 100 = 441
+        self.block_frame = (
+            int(np.round(self.gui_config.block_time * self.gui_config.samplerate / self.zc))
+            * self.zc
+        )
+        self.block_frame_16k = 320 * self.block_frame // self.zc
+        self.crossfade_frame = (
+            int(np.round(self.gui_config.crossfade_time * self.gui_config.samplerate / self.zc))
+            * self.zc
+        )
+        self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
+        self.sola_search_frame = self.zc
+        self.extra_frame = (
+            int(np.round(self.gui_config.extra_time_ce * self.gui_config.samplerate / self.zc))
+            * self.zc
+        )
+        self.extra_frame_right = (
+            int(np.round(self.gui_config.extra_time_right * self.gui_config.samplerate / self.zc))
+            * self.zc
+        )
+        self.input_wav: torch.Tensor = torch.zeros(
+            self.extra_frame
+            + self.crossfade_frame
+            + self.sola_search_frame
+            + self.block_frame
+            + self.extra_frame_right,
+            device=self.config.device,
+            dtype=torch.float32,
+        )  # 2 * 44100 + 0.08 * 44100 + 0.01 * 44100 + 0.25 * 44100
+        self.input_wav_denoise: torch.Tensor = self.input_wav.clone()
+        self.input_wav_res: torch.Tensor = torch.zeros(
+            320 * self.input_wav.shape[0] // self.zc,
+            device=self.config.device,
+            dtype=torch.float32,
+        )  # input wave 44100 -> 16000
+        self.rms_buffer: np.ndarray = np.zeros(4 * self.zc, dtype="float32")
+        self.sola_buffer: torch.Tensor = torch.zeros(
+            self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
+        )
+        self.nr_buffer: torch.Tensor = self.sola_buffer.clone()
+        self.output_buffer: torch.Tensor = self.input_wav.clone()
+        self.skip_head = self.extra_frame // self.zc
+        self.skip_tail = self.extra_frame_right // self.zc
+        self.return_length = (
+            self.block_frame + self.sola_buffer_frame + self.sola_search_frame
+        ) // self.zc
+        self.fade_in_window: torch.Tensor = (
+            torch.sin(
+                0.5
+                * np.pi
+                * torch.linspace(
+                    0.0,
+                    1.0,
+                    steps=self.sola_buffer_frame,
+                    device=self.config.device,
+                    dtype=torch.float32,
                 )
-                * self.zc
             )
-            self.input_wav: torch.Tensor = torch.zeros(
-                self.extra_frame
-                + self.crossfade_frame
-                + self.sola_search_frame
-                + self.block_frame
-                + self.extra_frame_right,
-                device=self.config.device,
-                dtype=torch.float32,
-            )  # 2 * 44100 + 0.08 * 44100 + 0.01 * 44100 + 0.25 * 44100
-            self.input_wav_denoise: torch.Tensor = self.input_wav.clone()
-            self.input_wav_res: torch.Tensor = torch.zeros(
-                320 * self.input_wav.shape[0] // self.zc,
-                device=self.config.device,
-                dtype=torch.float32,
-            )  # input wave 44100 -> 16000
-            self.rms_buffer: np.ndarray = np.zeros(4 * self.zc, dtype="float32")
-            self.sola_buffer: torch.Tensor = torch.zeros(
-                self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
-            )
-            self.nr_buffer: torch.Tensor = self.sola_buffer.clone()
-            self.output_buffer: torch.Tensor = self.input_wav.clone()
-            self.skip_head = self.extra_frame // self.zc
-            self.skip_tail = self.extra_frame_right // self.zc
-            self.return_length = (
-                self.block_frame + self.sola_buffer_frame + self.sola_search_frame
-            ) // self.zc
-            self.fade_in_window: torch.Tensor = (
-                torch.sin(
-                    0.5
-                    * np.pi
-                    * torch.linspace(
-                        0.0,
-                        1.0,
-                        steps=self.sola_buffer_frame,
-                        device=self.config.device,
-                        dtype=torch.float32,
-                    )
-                )
-                ** 2
-            )
-            self.fade_out_window: torch.Tensor = 1 - self.fade_in_window
-            self.resampler = tat.Resample(
-                orig_freq=self.gui_config.samplerate,
-                new_freq=16000,
+            ** 2
+        )
+        self.fade_out_window: torch.Tensor = 1 - self.fade_in_window
+        self.resampler = tat.Resample(
+            orig_freq=self.gui_config.samplerate,
+            new_freq=16000,
+            dtype=torch.float32,
+        ).to(self.config.device)
+        if self.model_set[-1]["sampling_rate"] != self.gui_config.samplerate:
+            self.resampler2 = tat.Resample(
+                orig_freq=self.model_set[-1]["sampling_rate"],
+                new_freq=self.gui_config.samplerate,
                 dtype=torch.float32,
             ).to(self.config.device)
-            if self.model_set[-1]["sampling_rate"] != self.gui_config.samplerate:
-                self.resampler2 = tat.Resample(
-                    orig_freq=self.model_set[-1]["sampling_rate"],
-                    new_freq=self.gui_config.samplerate,
-                    dtype=torch.float32,
-                ).to(self.config.device)
-            else:
-                self.resampler2 = None
-            self.vad_cache = {}
-            self.vad_chunk_size = 1000 * self.gui_config.block_time
-            self.vad_speech_detected = False
-            self.set_speech_detected_false_at_end_flag = False
-            self.start_stream()
+        else:
+            self.resampler2 = None
+        self.vad_cache = {}
+        self.vad_chunk_size = 1000 * self.gui_config.block_time
+        self.vad_speech_detected = False
+        self.set_speech_detected_false_at_end_flag = False
 
-        def start_stream(self):
-            global flag_vc
-            if not flag_vc:
-                flag_vc = True
-                if "WASAPI" in self.gui_config.sg_hostapi and self.gui_config.sg_wasapi_exclusive:
-                    extra_settings = sd.WasapiSettings(exclusive=True)
-                else:
-                    extra_settings = None
-                self.stream = sd.Stream(
-                    callback=self.audio_callback,
-                    blocksize=self.block_frame,
-                    samplerate=self.gui_config.samplerate,
-                    channels=self.gui_config.channels,
-                    dtype="float32",
-                    extra_settings=extra_settings,
+        self.start_stream()
+
+    # def start_stream(self):
+    #     global flag_vc
+    #     if not flag_vc:
+    #         flag_vc = True
+    #         self.stream = sd.Stream(
+    #             callback=self.audio_callback,
+    #             blocksize=self.block_frame,
+    #             samplerate=self.gui_config.samplerate,
+    #             channels=self.gui_config.channels,
+    #             dtype="float32",
+    #             extra_settings=None,
+    #         )
+    #         self.stream.start()
+
+    def start_stream(self):
+        """
+        Load a audio file and stream it to the audio callback
+        """
+        import librosa
+        import soundfile as sf
+
+        audio_file = "examples/source/source_s1.wav"
+        audio_data, sr = sf.read(audio_file, dtype="float32")
+        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=self.gui_config.samplerate)
+        print(self.gui_config.samplerate)
+        print(self.gui_config.channels)
+        print(f"Sample rate updated from {sr} to {audio_data.shape[0]}")
+
+        self.audio_callback(audio_data, audio_data)
+        sf.write("output.wav", audio_data, sr)
+
+    def audio_callback(self, indata: np.ndarray, outdata: np.ndarray):
+        """
+        Audio block callback function
+        """
+        global flag_vc
+        print(indata.shape)
+        start_time = time.perf_counter()
+        indata = librosa.to_mono(indata.T)
+
+        # VAD first
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_event.record()
+        indata_16k = librosa.resample(indata, orig_sr=self.gui_config.samplerate, target_sr=16000)
+        res = self.vad_model.generate(
+            input=indata_16k,
+            cache=self.vad_cache,
+            is_final=False,
+            chunk_size=self.vad_chunk_size,
+        )
+        res_value = res[0]["value"]
+        print(res_value)
+        if len(res_value) % 2 == 1 and not self.vad_speech_detected:
+            self.vad_speech_detected = True
+        elif len(res_value) % 2 == 1 and self.vad_speech_detected:
+            self.set_speech_detected_false_at_end_flag = True
+        end_event.record()
+        torch.cuda.synchronize()  # Wait for the events to be recorded!
+        elapsed_time_ms = start_event.elapsed_time(end_event)
+        print(f"Time taken for VAD: {elapsed_time_ms}ms")
+
+        self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
+        self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.config.device)
+        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
+            self.block_frame_16k :
+        ].clone()
+        self.input_wav_res[-320 * (indata.shape[0] // self.zc + 1) :] = self.resampler(
+            self.input_wav[-indata.shape[0] - 2 * self.zc :]
+        )[320:]
+        print(f"preprocess time: {time.perf_counter() - start_time:.2f}")
+
+        # infer
+        if self.function == "vc":
+            if self.gui_config.extra_time_ce - self.gui_config.extra_time < 0:
+                raise ValueError(
+                    "Content encoder extra context must be greater than DiT extra context!"
                 )
-                self.stream.start()
-
-        def stop_stream(self):
-            global flag_vc
-            if flag_vc:
-                flag_vc = False
-                if self.stream is not None:
-                    self.stream.abort()
-                    self.stream.close()
-                    self.stream = None
-
-        def audio_callback(self, indata: np.ndarray, outdata: np.ndarray, frames, times, status):
-            """
-            Audio block callback function
-            """
-            global flag_vc
-            print(indata.shape)
-            start_time = time.perf_counter()
-            indata = librosa.to_mono(indata.T)
-
-            # VAD first
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize()
             start_event.record()
-            indata_16k = librosa.resample(
-                indata, orig_sr=self.gui_config.samplerate, target_sr=16000
+            infer_wav = custom_infer(
+                self.model_set,
+                self.reference_wav,
+                self.gui_config.reference_audio_path,
+                self.input_wav_res,
+                self.skip_head,
+                self.skip_tail,
+                self.return_length,
+                int(self.gui_config.diffusion_steps),
+                self.gui_config.inference_cfg_rate,
+                self.gui_config.max_prompt_length,
+                self.gui_config.extra_time_ce - self.gui_config.extra_time,
             )
-            res = self.vad_model.generate(
-                input=indata_16k,
-                cache=self.vad_cache,
-                is_final=False,
-                chunk_size=self.vad_chunk_size,
-            )
-            res_value = res[0]["value"]
-            print(res_value)
-            if len(res_value) % 2 == 1 and not self.vad_speech_detected:
-                self.vad_speech_detected = True
-            elif len(res_value) % 2 == 1 and self.vad_speech_detected:
-                self.set_speech_detected_false_at_end_flag = True
+            if self.resampler2 is not None:
+                infer_wav = self.resampler2(infer_wav)
             end_event.record()
             torch.cuda.synchronize()  # Wait for the events to be recorded!
             elapsed_time_ms = start_event.elapsed_time(end_event)
-            print(f"Time taken for VAD: {elapsed_time_ms}ms")
+            print(f"Time taken for VC: {elapsed_time_ms}ms")
+            if not self.vad_speech_detected:
+                infer_wav = torch.zeros_like(self.input_wav[self.extra_frame :])
+        elif self.gui_config.I_noise_reduce:
+            infer_wav = self.input_wav_denoise[self.extra_frame :].clone()
+        else:
+            infer_wav = self.input_wav[self.extra_frame :].clone()
 
-            self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
-            self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.config.device)
-            self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
-                self.block_frame_16k :
-            ].clone()
-            self.input_wav_res[-320 * (indata.shape[0] // self.zc + 1) :] = self.resampler(
-                self.input_wav[-indata.shape[0] - 2 * self.zc :]
-            )[320:]
-            print(f"preprocess time: {time.perf_counter() - start_time:.2f}")
-            # infer
-            if self.function == "vc":
-                if self.gui_config.extra_time_ce - self.gui_config.extra_time < 0:
-                    raise ValueError(
-                        "Content encoder extra context must be greater than DiT extra context!"
-                    )
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                torch.cuda.synchronize()
-                start_event.record()
-                infer_wav = custom_infer(
-                    self.model_set,
-                    self.reference_wav,
-                    self.gui_config.reference_audio_path,
-                    self.input_wav_res,
-                    self.block_frame_16k,
-                    self.skip_head,
-                    self.skip_tail,
-                    self.return_length,
-                    int(self.gui_config.diffusion_steps),
-                    self.gui_config.inference_cfg_rate,
-                    self.gui_config.max_prompt_length,
-                    self.gui_config.extra_time_ce - self.gui_config.extra_time,
-                )
-                if self.resampler2 is not None:
-                    infer_wav = self.resampler2(infer_wav)
-                end_event.record()
-                torch.cuda.synchronize()  # Wait for the events to be recorded!
-                elapsed_time_ms = start_event.elapsed_time(end_event)
-                print(f"Time taken for VC: {elapsed_time_ms}ms")
-                if not self.vad_speech_detected:
-                    infer_wav = torch.zeros_like(self.input_wav[self.extra_frame :])
-            elif self.gui_config.I_noise_reduce:
-                infer_wav = self.input_wav_denoise[self.extra_frame :].clone()
-            else:
-                infer_wav = self.input_wav[self.extra_frame :].clone()
+        conv_input = infer_wav[None, None, : self.sola_buffer_frame + self.sola_search_frame]
 
-            conv_input = infer_wav[None, None, : self.sola_buffer_frame + self.sola_search_frame]
-
-            cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-            cor_den = torch.sqrt(
-                F.conv1d(
-                    conv_input**2,
-                    torch.ones(1, 1, self.sola_buffer_frame, device=self.config.device),
-                )
-                + 1e-8
+        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+        cor_den = torch.sqrt(
+            F.conv1d(
+                conv_input**2,
+                torch.ones(1, 1, self.sola_buffer_frame, device=self.config.device),
             )
-            if sys.platform == "darwin":
-                _, sola_offset = torch.max(cor_nom[0, 0] / cor_den[0, 0])
-                sola_offset = sola_offset.item()
-            else:
-                sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
+            + 1e-8
+        )
+        if sys.platform == "darwin":
+            _, sola_offset = torch.max(cor_nom[0, 0] / cor_den[0, 0])
+            sola_offset = sola_offset.item()
+        else:
+            sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
 
-            print(f"sola_offset = {int(sola_offset)}")
+        print(f"sola_offset = {int(sola_offset)}")
 
-            # post_process_start = time.perf_counter()
-            infer_wav = infer_wav[sola_offset:]
-            infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
-            infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
-            self.sola_buffer[:] = infer_wav[
-                self.block_frame : self.block_frame + self.sola_buffer_frame
-            ]
-            outdata[:] = (
-                infer_wav[: self.block_frame].repeat(self.gui_config.channels, 1).t().cpu().numpy()
-            )
+        infer_wav = infer_wav[sola_offset:]
+        infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
+        infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
+        self.sola_buffer[:] = infer_wav[
+            self.block_frame : self.block_frame + self.sola_buffer_frame
+        ]
+        outdata[:] = (
+            infer_wav[: self.block_frame].repeat(self.gui_config.channels, 1).t().cpu().numpy()
+        )
 
-            total_time = time.perf_counter() - start_time
-            if flag_vc:
-                self.window["infer_time"].update(int(total_time * 1000))
+        total_time = time.perf_counter() - start_time
 
-            if self.set_speech_detected_false_at_end_flag:
-                self.vad_speech_detected = False
-                self.set_speech_detected_false_at_end_flag = False
+        if self.set_speech_detected_false_at_end_flag:
+            self.vad_speech_detected = False
+            self.set_speech_detected_false_at_end_flag = False
 
-            print(f"Infer time: {total_time:.2f}")
+        print(f"Infer time: {total_time:.2f}")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--checkpoint-path", type=str, default=None, help="Path to the model checkpoint"
-    )
-    parser.add_argument(
-        "--config-path", type=str, default=None, help="Path to the vocoder checkpoint"
-    )
-    parser.add_argument(
-        "--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True
-    )
-    parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
-    args = parser.parse_args()
-    cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda"
-    device = torch.device(cuda_target if torch.cuda.is_available() else "cpu")
-    gui = GUI(args)
+        return outdata
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--checkpoint-path", type=str, default=None, help="Path to the model checkpoint"
+)
+parser.add_argument("--config-path", type=str, default=None, help="Path to the vocoder checkpoint")
+parser.add_argument(
+    "--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True
+)
+parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
+args = parser.parse_args()
+
+cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda"
+device = torch.device(cuda_target if torch.cuda.is_available() else "cpu")
+
+gui = GUI(args)
